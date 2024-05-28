@@ -22,6 +22,10 @@ using namespace rs2;
 
 void BaseRealSenseNode::setup()
 {
+#if defined (ACCELERATE_GPU_WITH_GLSL)
+    initOpenGLProcessing(_accelerate_gpu_with_glsl);
+    _is_accelerate_gpu_with_glsl_changed = false;
+#endif
     setDynamicParams();
     startDiagnosticsUpdater();
     setAvailableSensors();
@@ -39,8 +43,20 @@ void BaseRealSenseNode::monitoringProfileChanges()
     std::function<void()> func = [this, time_interval](){
         std::unique_lock<std::mutex> lock(_profile_changes_mutex);
         while(_is_running) {
-            _cv_mpc.wait_for(lock, std::chrono::milliseconds(time_interval), [&]{return (!_is_running || _is_profile_changed || _is_align_depth_changed);});
-            if (_is_running && (_is_profile_changed || _is_align_depth_changed))
+            _cv_mpc.wait_for(lock, std::chrono::milliseconds(time_interval),
+                                               [&]{return (!_is_running || _is_profile_changed
+                                                                        || _is_align_depth_changed
+                                                                        #if defined (ACCELERATE_GPU_WITH_GLSL)
+                                                                            || _is_accelerate_gpu_with_glsl_changed
+                                                                        #endif
+                                                           );});
+
+            if (_is_running && (_is_profile_changed
+                                        || _is_align_depth_changed
+                                        #if defined (ACCELERATE_GPU_WITH_GLSL)
+                                            || _is_accelerate_gpu_with_glsl_changed
+                                        #endif
+                                ))
             {
                 ROS_DEBUG("Profile has changed");
                 try
@@ -53,6 +69,10 @@ void BaseRealSenseNode::monitoringProfileChanges()
                 }
                 _is_profile_changed = false;
                 _is_align_depth_changed = false;
+
+                #if defined (ACCELERATE_GPU_WITH_GLSL)
+                    _is_accelerate_gpu_with_glsl_changed = false;
+                #endif
             }
         }
     };
@@ -136,8 +156,7 @@ void BaseRealSenseNode::setAvailableSensors()
         const std::string module_name(rs2_to_ros(sensor.get_info(RS2_CAMERA_INFO_NAME)));
         std::unique_ptr<RosSensor> rosSensor;
         if (sensor.is<rs2::depth_sensor>() ||
-            sensor.is<rs2::color_sensor>() ||
-            sensor.is<rs2::fisheye_sensor>())
+            sensor.is<rs2::color_sensor>())
         {
             ROS_DEBUG_STREAM("Set " << module_name << " as VideoSensor.");
             rosSensor = std::make_unique<RosSensor>(sensor, _parameters, frame_callback_function, update_sensor_func, hardware_reset_func, _diagnostics_updater, _logger, _use_intra_process, _dev.is<playback>());
@@ -146,11 +165,6 @@ void BaseRealSenseNode::setAvailableSensors()
         {
             ROS_DEBUG_STREAM("Set " << module_name << " as ImuSensor.");
             rosSensor = std::make_unique<RosSensor>(sensor, _parameters, imu_callback_function, update_sensor_func, hardware_reset_func, _diagnostics_updater, _logger, false, _dev.is<playback>());
-        }
-        else if (sensor.is<rs2::pose_sensor>())
-        {
-            ROS_DEBUG_STREAM("Set " << module_name << " as PoseSensor.");
-            rosSensor = std::make_unique<RosSensor>(sensor, _parameters, multiple_message_callback_function, update_sensor_func, hardware_reset_func, _diagnostics_updater, _logger, false, _dev.is<playback>());
         }
         else
         {
@@ -285,15 +299,8 @@ void BaseRealSenseNode::startPublishers(const std::vector<stream_profile>& profi
             IMUInfo info_msg = getImuInfo(profile);
             _imu_info_publishers[sip]->publish(info_msg);
         }
-        else if (profile.is<rs2::pose_stream_profile>())
-        {
-            std::stringstream data_topic_name, info_topic_name;
-            data_topic_name << "~/" << stream_name << "/sample";
-            _odom_publisher = _node.create_publisher<nav_msgs::msg::Odometry>(data_topic_name.str(),
-                rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(qos), qos));
-        }
         std::string topic_metadata("~/" + stream_name + "/metadata");
-        _metadata_publishers[sip] = _node.create_publisher<realsense2_camera_msgs::msg::Metadata>(topic_metadata,
+        _metadata_publishers[sip] = _node.create_publisher<realsense2_camera_msgs::msg::Metadata>(topic_metadata, 
             rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(info_qos), info_qos));
 
         if (!((rs2::stream_profile)profile==(rs2::stream_profile)_base_profile))
@@ -344,6 +351,34 @@ void BaseRealSenseNode::updateSensors()
 {
     std::lock_guard<std::mutex> lock_guard(_update_sensor_mutex);
     try{
+        stopRequiredSensors();
+
+        #if defined (ACCELERATE_GPU_WITH_GLSL)
+            if (_is_accelerate_gpu_with_glsl_changed)
+            {
+                shutdownOpenGLProcessing();
+
+                initOpenGLProcessing(_accelerate_gpu_with_glsl);
+            }
+        #endif
+
+        startUpdatedSensors();
+    }
+    catch(const std::exception& ex)
+    {
+        ROS_ERROR_STREAM(__FILE__ << ":" << __LINE__ << ":" << "An exception has been thrown: " << ex.what());
+        throw;
+    }
+    catch(...)
+    {
+        ROS_ERROR_STREAM(__FILE__ << ":" << __LINE__ << ":" << "Unknown exception has occured!");
+        throw;
+    }
+}
+
+void BaseRealSenseNode::stopRequiredSensors()
+{
+    try{
         for(auto&& sensor : _available_ros_sensors)
         {
             std::string module_name(rs2_to_ros(sensor->get_info(RS2_CAMERA_INFO_NAME)));
@@ -351,23 +386,63 @@ void BaseRealSenseNode::updateSensors()
             std::vector<stream_profile> wanted_profiles;
 
             bool is_profile_changed(sensor->getUpdatedProfiles(wanted_profiles));
-            bool is_video_sensor = (sensor->is<rs2::depth_sensor>() || sensor->is<rs2::color_sensor>() || sensor->is<rs2::fisheye_sensor>());
+            bool is_video_sensor = (sensor->is<rs2::depth_sensor>() || sensor->is<rs2::color_sensor>());
 
-            // do all updates if profile has been changed, or if the align depth filter status has been changed
+            // do all updates if profile has been changed, or if the align depth filter or gpu acceleration status has been changed
             // and we are on a video sensor. TODO: explore better options to monitor and update changes
             // without resetting the whole sensors and topics.
-            if (is_profile_changed || (_is_align_depth_changed && is_video_sensor))
+            if (is_profile_changed || (is_video_sensor && (_is_align_depth_changed
+                                                                #if defined (ACCELERATE_GPU_WITH_GLSL)
+                                                                    || _is_accelerate_gpu_with_glsl_changed
+                                                                #endif
+                                                            )))
             {
                 std::vector<stream_profile> active_profiles = sensor->get_active_streams();
-                if(is_profile_changed)
+                if (is_profile_changed
+                        #if defined (ACCELERATE_GPU_WITH_GLSL)
+                            || _is_accelerate_gpu_with_glsl_changed
+                        #endif
+                    )
                 {
-                    // Start/stop sensors only if profile was changed
+                    // Start/stop sensors only if profile or gpu acceleration status was changed
                     // No need to start/stop sensors if align_depth was changed
                     ROS_INFO_STREAM("Stopping Sensor: " << module_name);
                     sensor->stop();
                 }
                 stopPublishers(active_profiles);
+            }
+        }
+    }
+    catch(const std::exception& ex)
+    {
+        ROS_ERROR_STREAM(__FILE__ << ":" << __LINE__ << ":" << "An exception has been thrown: " << ex.what());
+        throw;
+    }
+    catch(...)
+    {
+        ROS_ERROR_STREAM(__FILE__ << ":" << __LINE__ << ":" << "Unknown exception has occured!");
+        throw;
+    }
+}
 
+void BaseRealSenseNode::startUpdatedSensors()
+{
+    try{
+        for(auto&& sensor : _available_ros_sensors)
+        {
+            std::string module_name(rs2_to_ros(sensor->get_info(RS2_CAMERA_INFO_NAME)));
+            // if active_profiles != wanted_profiles: stop sensor.
+            std::vector<stream_profile> wanted_profiles;
+
+            bool is_profile_changed(sensor->getUpdatedProfiles(wanted_profiles));
+            bool is_video_sensor = (sensor->is<rs2::depth_sensor>() || sensor->is<rs2::color_sensor>());
+
+            if (is_profile_changed || (is_video_sensor && (_is_align_depth_changed
+                                                                #if defined (ACCELERATE_GPU_WITH_GLSL)
+                                                                    || _is_accelerate_gpu_with_glsl_changed
+                                                                #endif
+                                                            )))
+            {
                 if (!wanted_profiles.empty())
                 {
                     startPublishers(wanted_profiles, *sensor);
@@ -381,9 +456,13 @@ void BaseRealSenseNode::updateSensors()
                         }
                     }
 
-                    if(is_profile_changed)
+                    if (is_profile_changed
+                            #if defined (ACCELERATE_GPU_WITH_GLSL)
+                                || _is_accelerate_gpu_with_glsl_changed
+                            #endif
+                        )
                     {
-                        // Start/stop sensors only if profile was changed
+                        // Start/stop sensors only if profile or gpu acceleration was changed
                         // No need to start/stop sensors if align_depth was changed
                         ROS_INFO_STREAM("Starting Sensor: " << module_name);
                         sensor->start(wanted_profiles);

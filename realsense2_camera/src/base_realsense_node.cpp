@@ -22,10 +22,7 @@
 
 // Header files for disabling intra-process comms for static broadcaster.
 #include <rclcpp/publisher_options.hpp>
-// This header file is not available in ROS 2 Dashing.
-#ifndef DASHING
 #include <tf2_ros/qos.hpp>
-#endif
 
 using namespace realsense2_camera;
 
@@ -37,7 +34,11 @@ SyncedImuPublisher::SyncedImuPublisher(rclcpp::Publisher<sensor_msgs::msg::Imu>:
 
 SyncedImuPublisher::~SyncedImuPublisher()
 {
-    PublishPendingMessages();
+    try
+    {
+        PublishPendingMessages();
+    }
+    catch(...){} // Not allowed to throw from Dtor
 }
 
 void SyncedImuPublisher::Publish(sensor_msgs::msg::Imu imu_msg)
@@ -115,10 +116,14 @@ BaseRealSenseNode::BaseRealSenseNode(rclcpp::Node& node,
     _is_accel_enabled(false),
     _is_gyro_enabled(false),
     _pointcloud(false),
-    _publish_odom_tf(false),
     _imu_sync_method(imu_sync_method::NONE),
     _is_profile_changed(false),
     _is_align_depth_changed(false)
+#if defined (ACCELERATE_GPU_WITH_GLSL)
+    ,_app(1280, 720, "RS_GLFW_Window"),
+    _accelerate_gpu_with_glsl(false),
+    _is_accelerate_gpu_with_glsl_changed(false)
+#endif
 {
     if ( use_intra_process )
     {
@@ -148,10 +153,14 @@ BaseRealSenseNode::~BaseRealSenseNode()
         _monitoring_pc->join();
     }
     clearParameters();
-    for(auto&& sensor : _available_ros_sensors)
+    try
     {
-        sensor->stop();
+        for(auto&& sensor : _available_ros_sensors)
+        {
+            sensor->stop();
+        }
     }
+    catch(...){} // Not allowed to throw from Dtor
 }
 
 void BaseRealSenseNode::hardwareResetRequest()
@@ -233,14 +242,22 @@ void BaseRealSenseNode::setupFilters()
         _cv_mpc.notify_one();
     };
 
-    _colorizer_filter = std::make_shared<NamedFilter>(std::make_shared<rs2::colorizer>(), _parameters, _logger); 
-    _filters.push_back(_colorizer_filter);
-
+#if defined (ACCELERATE_GPU_WITH_GLSL)
+    _colorizer_filter = std::make_shared<NamedFilter>(std::make_shared<rs2::gl::colorizer>(), _parameters, _logger); 
+    _pc_filter = std::make_shared<PointcloudFilter>(std::make_shared<rs2::gl::pointcloud>(), _node, _parameters, _logger);
+#else
+    _colorizer_filter = std::make_shared<NamedFilter>(std::make_shared<rs2::colorizer>(), _parameters, _logger);
     _pc_filter = std::make_shared<PointcloudFilter>(std::make_shared<rs2::pointcloud>(), _node, _parameters, _logger);
+#endif
+
+    // Apply PointCloud filter before applying Align-depth as it requires original depth image not aligned-depth image.
     _filters.push_back(_pc_filter);
 
     _align_depth_filter = std::make_shared<AlignDepthFilter>(std::make_shared<rs2::align>(RS2_STREAM_COLOR), update_align_depth_func, _parameters, _logger);
     _filters.push_back(_align_depth_filter);
+
+    // Apply Colorizer filter after applying Align-Depth to get colorized aligned depth image.
+    _filters.push_back(_colorizer_filter);
 }
 
 cv::Mat& BaseRealSenseNode::fix_depth_scale(const cv::Mat& from_image, cv::Mat& to_image)
@@ -630,9 +647,6 @@ void BaseRealSenseNode::multiple_message_callback(rs2::frame frame, imu_sync_met
             if (sync_method > imu_sync_method::NONE) imu_callback_sync(frame, sync_method);
             else imu_callback(frame);
             break;
-        case RS2_STREAM_POSE:
-            pose_callback(frame);
-            break;
         default:
             frame_callback(frame);
     }
@@ -640,7 +654,11 @@ void BaseRealSenseNode::multiple_message_callback(rs2::frame frame, imu_sync_met
 
 bool BaseRealSenseNode::setBaseTime(double frame_time, rs2_timestamp_domain time_domain)
 {
-    ROS_WARN_ONCE(time_domain == RS2_TIMESTAMP_DOMAIN_SYSTEM_TIME ? "Frame metadata isn't available! (frame_timestamp_domain = RS2_TIMESTAMP_DOMAIN_SYSTEM_TIME)" : "");
+    if (time_domain == RS2_TIMESTAMP_DOMAIN_SYSTEM_TIME)
+    {
+        ROS_WARN_ONCE("Frame metadata isn't available! (frame_timestamp_domain = RS2_TIMESTAMP_DOMAIN_SYSTEM_TIME)");
+    }
+
     if (time_domain == RS2_TIMESTAMP_DOMAIN_HARDWARE_CLOCK)
     {
         ROS_WARN("frame's time domain is HARDWARE_CLOCK. Timestamps may reset periodically.");
@@ -673,12 +691,9 @@ rclcpp::Time BaseRealSenseNode::frameSystemTimeSec(rs2::frame frame)
         double elapsed_camera_ns = millisecondsToNanoseconds(timestamp_ms - _camera_time_base);
 
         /*
-        Fixing deprecated-declarations compilation warning.
-        Duration(rcl_duration_value_t) is deprecated in favor of 
-        static Duration::from_nanoseconds(rcl_duration_value_t)
-        starting from GALACTIC.
+        Fixing deprecated-declarations compilation error for EOL distro (foxy)
         */
-#if defined(FOXY) || defined(ELOQUENT) || defined(DASHING)
+#if defined(FOXY)
         auto duration = rclcpp::Duration(elapsed_camera_ns);
 #else
         auto duration = rclcpp::Duration::from_nanoseconds(elapsed_camera_ns);
@@ -715,8 +730,19 @@ void BaseRealSenseNode::updateProfilesStreamCalibData(const std::vector<rs2::str
 void BaseRealSenseNode::updateStreamCalibData(const rs2::video_stream_profile& video_profile)
 {
     stream_index_pair stream_index{video_profile.stream_type(), video_profile.stream_index()};
-    auto intrinsic = video_profile.get_intrinsics();
-    _stream_intrinsics[stream_index] = intrinsic;
+
+    rs2_intrinsics intrinsic;
+    try
+    {
+        intrinsic = video_profile.get_intrinsics();
+    }
+    catch(const std::exception& ex)
+    {
+        // e.g. infra1/infra2 in Y16i format (calibration mode) doesn't have intrinsics.
+        ROS_WARN_STREAM("No intrinsics available for this stream profile. Using zeroed intrinsics as default.");
+        intrinsic = { 0, 0, 0, 0, 0, 0, RS2_DISTORTION_NONE ,{ 0,0,0,0,0 } };
+    }
+
     _camera_info[stream_index].width = intrinsic.width;
     _camera_info[stream_index].height = intrinsic.height;
     _camera_info[stream_index].header.frame_id = OPTICAL_FRAME_ID(stream_index);
@@ -788,7 +814,7 @@ void BaseRealSenseNode::updateExtrinsicsCalibData(const rs2::video_stream_profil
 
 void BaseRealSenseNode::SetBaseStream()
 {
-    const std::vector<stream_index_pair> base_stream_priority = {DEPTH, POSE};
+    const std::vector<stream_index_pair> base_stream_priority = {DEPTH};
     std::set<stream_index_pair> checked_sips;
     std::map<stream_index_pair, rs2::stream_profile> available_profiles;
     for(auto&& sensor : _available_ros_sensors)
@@ -818,7 +844,7 @@ void BaseRealSenseNode::SetBaseStream()
 
 void BaseRealSenseNode::publishPointCloud(rs2::points pc, const rclcpp::Time& t, const rs2::frameset& frameset)
 {
-    std::string frame_id = (_align_depth_filter->is_enabled() ? OPTICAL_FRAME_ID(COLOR) : OPTICAL_FRAME_ID(DEPTH));
+    std::string frame_id = OPTICAL_FRAME_ID(DEPTH);
     _pc_filter->Publish(pc, t, frameset, frame_id);
 }
 
@@ -896,7 +922,6 @@ bool BaseRealSenseNode::fillROSImageMsgAndReturnStatus(
     img_msg_ptr->width = width;
     img_msg_ptr->is_bigendian = false;
     img_msg_ptr->step = width * cv_matrix_image.elemSize();
-
     return true;
 }
 
@@ -1158,10 +1183,18 @@ void BaseRealSenseNode::startDiagnosticsUpdater()
             {
                 for (rs2_option option : _monitor_options)
                 {
-                    if (sensor->supports(option))
+                    try
                     {
-                        status.add(rs2_option_to_string(option), sensor->get_option(option));
-                        got_temperature = true;
+                        if (sensor->supports(option))
+                        {
+                            status.add(rs2_option_to_string(option), sensor->get_option(option));
+                            got_temperature = true;
+                        }
+                    }
+                    catch(const std::exception& ex)
+                    {
+                        got_temperature = false;
+                        ROS_WARN_STREAM("An error has occurred during monitoring: " << ex.what());
                     }
                 }
                 if (got_temperature) break;
